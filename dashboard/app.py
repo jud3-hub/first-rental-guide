@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 SHEET_ID = "1kvg4lgNtJ3nUugUMXFkYg0HxwuqgqrXR-Nw-KYrvN34"
-EXPERIMENTS = ["EXP01", "EXP06"]
+EXPERIMENTS = ["EXP01", "EXP02", "EXP03", "EXP04", "EXP05", "EXP06"]
 QUESTIONS = {"Q01", "Q04", "Q05"}
 RUBRIC = "rubric-v2"
 REQUIRED = [
@@ -88,7 +88,7 @@ def prepare_data(raw_results, raw_summary, raw_references):
     summary["실험 ID"] = summary["실험"].astype(str).str.extract(r"^(EXP\d+)\s*·")
     summary = summary[summary["실험 ID"].isin(EXPERIMENTS)].copy()
     if set(summary["실험 ID"]) != set(EXPERIMENTS) or summary["실험 ID"].duplicated().any():
-        raise ValueError("실험 비교 탭에서 EXP01 · EXP06 요약을 각 1행씩 확인해 주세요.")
+        raise ValueError("실험 비교 탭에서 EXP01~EXP06 요약을 각 1행씩 확인해 주세요.")
     references = table_from_rows(raw_references, ["ID", "질문", "기준 답변", "근거 조문"])
     q01 = references[references["ID"] == "Q01"]
     if len(q01) != 1:
@@ -99,7 +99,7 @@ def prepare_data(raw_results, raw_summary, raw_references):
 def main():
     st.set_page_config(page_title="홈런 · LLM 성능 비교", page_icon="🏠", layout="wide")
     st.title("홈런 · LLM 성능 비교")
-    st.caption("EXP01 · EXP06 비교 / 기존 실험 결과 열람 / 모델 추론 없음")
+    st.caption("EXP01~EXP06 비교 / 기존 실험 결과 열람 / 모델 추론 없음")
     if st.button("최신 데이터 불러오기"):
         load_data.clear()
     try:
@@ -118,7 +118,7 @@ def main():
     left, right = st.columns(2)
     label = lambda exp: str(summary.loc[exp, "실험"])
     base = left.selectbox("기준 실험", EXPERIMENTS, index=0, format_func=label)
-    target = right.selectbox("비교 실험", EXPERIMENTS, index=1, format_func=label)
+    target = right.selectbox("비교 실험", EXPERIMENTS, index=5, format_func=label)
     st.caption("평가 범위: 개발용 Q01 · Q04 · Q05 / rubric-v2 / 최대 60초 캐시")
     if base == target:
         st.info("같은 실험을 선택했습니다. 다른 실험을 선택하면 변경 전후를 비교할 수 있습니다.")
