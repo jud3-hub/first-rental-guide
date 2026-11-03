@@ -1,5 +1,9 @@
 """홈런 최소 대시보드: Google Sheets 읽기 → 실험 비교 → Q01 답변 비교."""
 
+import difflib
+import json
+from pathlib import Path
+
 import gspread
 import pandas as pd
 import streamlit as st
@@ -96,6 +100,104 @@ def prepare_data(raw_results, raw_summary, raw_references):
     return results, summary.set_index("실험 ID"), q01.iloc[0]
 
 
+def comparison_rows(a, b):
+    """버전 이름 대신 실제 입력 · 설정 값으로 변경 여부 판단."""
+    def parts(record):
+        prompt = record["system_prompt"]
+        before_law, _, law = prompt.partition("[참고 법령 원문]")
+        role, _, rules = before_law.partition("[답변 작성 지시]")
+        examples = record.get("few_shot_messages", [])
+        return {
+            "model": (record["model_id"], record["model_id"]),
+            "role": (role.strip(), "임대차 안내 역할 · 정보 부족 시 질문 · 단정 및 창작 금지" if "안내 도우미" in role else "한국어로 답변하라는 최소 지시"),
+            "law": (law.strip(), "주택임대차보호법 조문 3개 직접 제공" if law.strip() else "법령 원문 제공 없음"),
+            "rules": (rules.strip(), "설명 · 근거 · 추가 확인 형식 / 조문 인용 / 허위 절차 · 수치 금지" if rules.strip() else "추가 답변 형식 · 근거 활용 규칙 없음"),
+            "examples": (examples, f"질문 · 답변 예시 {len(examples) // 2}쌍" if examples else "예시 없음"),
+            "rag": (record["rag"], "사용" if record["rag"] else "미사용 · 검색 파이프라인 없음"),
+            "ft": (record["fine_tuning"], "사용" if record["fine_tuning"] else "미사용 · 모델 가중치 학습 없음"),
+            "generation": ((record["do_sample"], record["max_new_tokens"], record["dtype"]),
+                           f"{'샘플링' if record['do_sample'] else 'greedy'} · 최대 {record['max_new_tokens']}토큰 · {record['dtype']}"),
+        }
+    left, right = parts(a), parts(b)
+    fields = [
+        ("오픈소스 LLM · 추론", "모델 선택", "model"),
+        ("프롬프트 엔지니어링", "역할 · 답변 원칙", "role"),
+        ("컨텍스트 입력", "법령 원문 직접 제공", "law"),
+        ("프롬프트 엔지니어링", "근거 활용 · 답변 형식", "rules"),
+        ("프롬프트 엔지니어링", "Few-shot", "examples"),
+        ("RAG · 검색", "검색 파이프라인", "rag"),
+        ("파인튜닝", "모델 학습", "ft"),
+        ("오픈소스 LLM · 추론", "생성 설정", "generation"),
+    ]
+    return [{"대분류": group, "중분류": name, "기준 실험": left[key][1],
+             "비교 실험": right[key][1],
+             "변경 여부": "동일" if left[key][0] == right[key][0] else "변경"}
+            for group, name, key in fields]
+
+
+def explain_comparison(results, base, target):
+    """실행 기록이 현재 선택한 실행과 일치할 때만 설명 표시."""
+    try:
+        notes = json.loads(Path(__file__).with_name("experiment_settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st.warning("실험 설명 파일을 읽지 못했습니다. experiment_settings.json을 확인해 주세요.")
+        return
+    selected = []
+    for exp in [base, target]:
+        actual = results[results["실험"] == exp].iloc[0]
+        note = notes.get(exp)
+        if not note or any(str(note.get(key, "")) != str(actual[column])
+                           for key, column in [("run_id", "실행 ID"), ("model_id", "모델"), ("prompt_version", "프롬프트")]):
+            st.warning(f"{exp}: 현재 실행에 해당하는 설명이 미등록되었거나 설정 기록과 다릅니다. 기존 설명은 표시하지 않습니다.")
+            return
+        selected.append(note)
+    a, b = selected
+    st.subheader("이번 비교에서 무엇을 바꿨나요?")
+    for exp, note, column in zip([base, target], selected, st.columns(2)):
+        with column:
+            with st.container(border=True):
+                st.markdown(f"**{exp} · {note['name']}**")
+                st.write("실험 목적: " + note["purpose"])
+                origin = "최초 기준" if note["changed_from"] == "없음" else note["changed_from"] + " 대비"
+                st.write(f"설계 당시 변경점 ({origin}): {note['change_summary']}")
+    rows = comparison_rows(a, b)
+    changed = [r for r in rows if r["변경 여부"] == "변경"]
+    if not changed:
+        st.info("선택한 두 실험의 입력 · 설정은 동일합니다.")
+    else:
+        names = " · ".join(r["중분류"] for r in changed)
+        st.markdown(f"**현재 선택한 {base} → {target}의 차이: {names}**")
+        if len(changed) > 1:
+            st.warning("여러 조건이 함께 달라졌습니다. 점수 차이를 특정 기술 하나의 효과로 단정할 수 없습니다.")
+    if a["evaluation_set"] == b["evaluation_set"]:
+        st.caption(f"공통 평가셋: {a['evaluation_set']} · rubric-v2. 조문 직접 제공는 검색 과정이 있는 RAG와 구분.")
+    else:
+        st.warning("실행 기록의 평가셋이 다릅니다. 점수를 직접 비교하기 전에 평가 범위를 확인해 주세요.")
+    # 초기에는 바뀐 항목만 보여주고 동일한 항목은 펼쳐서 확인.
+    if changed:
+        st.dataframe(pd.DataFrame(changed), hide_index=True, width="stretch")
+    with st.expander("동일한 조건을 포함한 전체 기술 설정"):
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    with st.expander("프롬프트 원문 · 예시 · 변경 줄 확인"):
+        st.caption("설명 출처: 해당 실행에서 저장한 settings.json. 시트의 버전 이름만으로 추정하지 않음.")
+        for exp, note in zip([base, target], selected):
+            st.markdown(f"**{exp} 시스템 프롬프트**")
+            st.code(note["system_prompt"], language="text")
+            st.markdown(f"**{exp} Few-shot 메시지**")
+            if note["few_shot_messages"]:
+                for message in note["few_shot_messages"]:
+                    st.caption("예시 질문" if message["role"] == "user" else "예시 답변")
+                    st.text(message["content"])
+            else:
+                st.write("예시 없음")
+        diff = "\n".join(difflib.unified_diff(a["system_prompt"].splitlines(), b["system_prompt"].splitlines(), fromfile=base, tofile=target, lineterm=""))
+        st.markdown("**시스템 프롬프트 변경 줄**")
+        if diff:
+            st.code(diff, language="diff")
+        else:
+            st.write("시스템 프롬프트 원문 동일. 예시 메시지는 위에서 별도 확인.")
+
+
 def main():
     st.set_page_config(page_title="홈런 · LLM 성능 비교", page_icon="🏠", layout="wide")
     st.title("홈런 · LLM 성능 비교")
@@ -122,6 +224,8 @@ def main():
     st.caption("평가 범위: 개발용 Q01 · Q04 · Q05 / rubric-v2 / 최대 60초 캐시")
     if base == target:
         st.info("같은 실험을 선택했습니다. 다른 실험을 선택하면 변경 전후를 비교할 수 있습니다.")
+
+    explain_comparison(results, base, target)
 
     st.subheader("1. 전체 결과 비교")
     totals, criticals, checked = {}, {}, {}
@@ -153,7 +257,7 @@ def main():
                          "프롬프트 · 기록 버전": row["프롬프트"], "실행 ID": row["실행 ID"],
                          "루브릭": row["루브릭 버전"]})
     st.dataframe(pd.DataFrame(settings), hide_index=True, width="stretch")
-    st.caption("위 설정은 시트에 기록된 값. RAG · 파인튜닝 등 상세 기술 설정은 이 최소 버전에서 표시하지 않음.")
+    st.caption("위 표는 시트에 기록된 원본 식별 정보. 구체적 변경점은 상단의 실행 기록 기반 비교 참고.")
 
     st.subheader("3. 질문별 상세 비교 · Q01")
     st.write(str(reference["질문"]))
