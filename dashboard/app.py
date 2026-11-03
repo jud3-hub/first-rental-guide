@@ -14,7 +14,7 @@ QUESTIONS = {"Q01", "Q04", "Q05"}
 RUBRIC = "rubric-v2"
 REQUIRED = [
     "실험", "실행 ID", "질문 ID", "유형", "모델", "프롬프트", "점수 /10",
-    "치명 오류(AI)", "필수 동작", "실행 상태", "모델 답변", "루브릭 버전",
+    "응답 시간(초)", "치명 오류(AI)", "필수 동작", "실행 상태", "모델 답변", "루브릭 버전",
     "허위 절차(AI)", "근거 없는 수치(AI)", "사람 검토",
     "최종 치명 오류(사람)", "검토자", "사람 판단 근거",
 ]
@@ -71,6 +71,15 @@ def prepare_data(raw_results, raw_summary, raw_references):
     )
     if invalid_scores.any():
         raise ValueError("점수 열에 숫자가 아니거나 0~10 범위를 벗어난 값이 있습니다.")
+    raw_latency = results["응답 시간(초)"].replace("", pd.NA)
+    results["응답 시간(초)"] = pd.to_numeric(raw_latency, errors="coerce")
+    invalid_latency = (
+        (raw_latency.notna() & results["응답 시간(초)"].isna())
+        | results["응답 시간(초)"].lt(0)
+        | results["응답 시간(초)"].isin([float("inf"), float("-inf")])
+    )
+    if invalid_latency.any():
+        raise ValueError("응답 시간은 0 이상의 유한한 숫자여야 합니다. 미측정은 빈칸으로 남겨 주세요.")
     keys = ["실험", "실행 ID", "질문 ID", "루브릭 버전"]
     if results.duplicated(keys).any():
         raise ValueError("실행 · 질문 · 루브릭이 같은 중복 행이 있습니다.")
@@ -98,6 +107,48 @@ def prepare_data(raw_results, raw_summary, raw_references):
     if len(q01) != 1:
         raise ValueError("평가 기준 탭에서 Q01 기준 답변을 확인해 주세요.")
     return results, summary.set_index("실험 ID"), q01.iloc[0]
+
+
+def latency_stats(part):
+    """정상 완료 · 측정된 응답만 평균. 미측정을 0초로 취급하지 않음."""
+    measured = part.loc[part["실행 상태"].eq("ok"), "응답 시간(초)"].dropna()
+    return {"mean": measured.mean(), "count": len(measured), "expected": len(part)}
+
+
+def latency_table(results, base, target):
+    """같은 질문의 정상 완료 응답끼리 시간 차이 계산."""
+    rows = []
+    for question in sorted(QUESTIONS):
+        a = results[(results["실험"] == base) & (results["질문 ID"] == question)].iloc[0]
+        b = results[(results["실험"] == target) & (results["질문 ID"] == question)].iloc[0]
+        av = a["응답 시간(초)"] if a["실행 상태"] == "ok" else float("nan")
+        bv = b["응답 시간(초)"] if b["실행 상태"] == "ok" else float("nan")
+        rows.append({"질문": question, "유형": a["유형"],
+                     f"기준 {base} (초)": av, f"비교 {target} (초)": bv,
+                     "시간 차이 (초)": bv - av})
+    return pd.DataFrame(rows)
+
+
+def render_latency(results, base, target):
+    st.markdown("**응답 시간 (Latency)**")
+    a = latency_stats(results[results["실험"] == base])
+    b = latency_stats(results[results["실험"] == target])
+    display = lambda value: "미측정" if pd.isna(value) else f"{value:.2f}초"
+    delta = None if pd.isna(a["mean"]) or pd.isna(b["mean"]) else f"{b['mean'] - a['mean']:+.2f}초"
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"기준 {base} · 평균 응답", display(a["mean"]))
+    c2.metric(f"비교 {target} · 평균 응답", display(b["mean"]), delta=delta, delta_color="inverse")
+    c3.metric("평균에 포함한 질문 수", f"{a['count']}/{a['expected']} → {b['count']}/{b['expected']}건")
+    st.caption("차이 = 비교 − 기준. 음수는 더 빠름 · 양수는 더 느림. 정상 완료된 측정값만 평균에 포함하며 미측정은 0초가 아님.")
+    if a["count"] != a["expected"] or b["count"] != b["expected"]:
+        st.warning("미측정 또는 정상 완료가 아닌 응답이 있어 평균의 질문 구성이 다를 수 있습니다. 질문별 시간을 함께 확인해 주세요.")
+    # 기록된 전체 질문 시간을 보여주되, 답변 상세 영역은 기존 Q01 유지.
+    st.dataframe(latency_table(results, base, target), hide_index=True, width="stretch",
+                 column_config={f"기준 {base} (초)": st.column_config.NumberColumn(format="%.2f"),
+                                f"비교 {target} (초)": st.column_config.NumberColumn(format="%.2f"),
+                                "시간 차이 (초)": st.column_config.NumberColumn(format="%+.2f")})
+    st.caption("시간이 비어 있으면 미측정 또는 정상 완료 아님. 모델 크기 · 입력 길이 · 답변 길이 · GPU 상태가 달라질 수 있어 이 값만으로 속도 개선 효과를 단정하지 않음.")
+    st.caption("현재 실험의 측정 범위: 입력 구성 · GPU 전송 · 생성 · 디코딩. 모델 로딩 · 파일 저장 · 화면 표시는 제외. 첫 토큰 시간(TTFT) · 토큰/초는 별도 기록되지 않아 표시하지 않음.")
 
 
 def comparison_rows(a, b):
@@ -249,6 +300,8 @@ def main():
     st.bar_chart(pd.DataFrame({"실험": list(totals), "AI 총점": list(totals.values())}).set_index("실험"), y_label="점수 / 최대 30점")
     st.caption("질문 3개 · 실험별 1회 실행의 개발용 결과. 전체 법률 상담 성능을 의미하지 않음.")
 
+    render_latency(results, base, target)
+
     st.subheader("2. 실험 설정 비교")
     settings = []
     for exp in [base, target]:
@@ -270,6 +323,8 @@ def main():
             st.markdown(f"**{label(exp)}**")
             score = "미채점" if pd.isna(row["점수 /10"]) else f"{row['점수 /10']:.0f} / 10점"
             st.metric("Q01 AI 점수", score)
+            measured = row["응답 시간(초)"]
+            st.metric("Q01 응답 시간", "미측정" if pd.isna(measured) else f"{measured:.2f}초")
             # 사용자/모델 텍스트를 HTML로 실행하지 않고 그대로 출력.
             st.text(str(row["모델 답변"]))
             st.caption(f"실행 상태: {row['실행 상태']}")
